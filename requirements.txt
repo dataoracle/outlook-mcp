@@ -1,0 +1,6 @@
+fastmcp==4.1.0
+httpx==0.28.1
+uvicorn==0.53.0
+cryptography==50.0.2
+pypdf==6.21.4
+markdown==3.11.2
