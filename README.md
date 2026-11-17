@@ -1,9 +1,11 @@
-# outlook-mcp: Outlook mail MCP server
+# outlook-mcp: Outlook mail and calendar MCP server
 
 An MCP server that lets Claude (or any MCP client) work with your Exchange
 Online / Outlook mailbox as you: find and read mail, follow conversations,
 read attachments, prepare drafts, keep the mailbox organised and, once you
-approve, send mail on your behalf.
+approve, send mail on your behalf. It also reads your calendar, finds free
+time (yours and your colleagues'), creates appointments and meetings, and
+answers invitations.
 
 It is the mail sibling of [msteams-mcp](https://github.com/dataoracle/msteams-mcp)
 and shares its design. It uses **delegated** Microsoft Graph permissions: you
@@ -54,10 +56,31 @@ or a backup without this machine's TPM can't read the token.
 | `reply(message_id, body, reply_all?, format?, cc?, attachments?)` ✉️ | Reply and send now |
 | `forward(message_id, to, body?, cc?, format?, attachments?)` ✉️ | Forward and send now |
 
+**Calendar** (registered when `ENABLE_CALENDAR_TOOLS=true`, the default):
+
+| Tool | Returns / does |
+|---|---|
+| `list_calendars()` | Your calendars with ids, owner and whether you can edit them |
+| `list_events(start?, end?, days?, calendar?, query?, needs_response?, limit?)` | Events in a range (default: today + 7 days), recurring meetings expanded: time, subject, place, Teams, your response, organiser, attendee replies, ids. `needs_response=True` lists unanswered invitations |
+| `get_event(event_id)` | One event in full: time, recurrence, Teams link, organiser, every attendee's response, description |
+| `find_free_time(start?, end?, duration_minutes?, attendees?, working_hours_only?, tentative_is_busy?)` | Open slots for you and, optionally, colleagues (their Outlook free/busy), within your working hours |
+| `create_event(subject, start, end? \| duration_minutes?, all_day?, attendees?, optional_attendees?, location?, body?, online_meeting?, show_as?, reminder_minutes?, categories?, sensitivity?, calendar?, repeat?, repeat_until?, repeat_count?)` ✏️📅 | An appointment, or a meeting (invitations sent) when attendees are given; Teams link with `online_meeting=True`; daily/weekdays/weekly/biweekly/monthly series |
+| `update_event(event_id, subject?, start?, end?, location?, body?, add_attendees?, add_optional_attendees?, remove_attendees?, online_meeting?, show_as?, reminder_minutes?, categories?)` ✏️📅 | Change an event; for a meeting you organise, attendees get an update |
+| `respond_to_event(response, event_id \| message_id, comment?, send_response?, propose_start?, propose_end?)` ✏️📅 | Accept, tentatively accept or decline an invitation (from the calendar or the invitation email), optionally proposing a new time |
+| `cancel_event(event_id, comment?)` ✏️📅 | Cancel a meeting you organise (attendees are notified), or delete an appointment |
+
+Calendar times are shown and entered in your time zone (`TIMEZONE`, or your
+Outlook setting), not UTC: `start="2026-11-18T09:30"` means 09:30 your time.
+Dates (`2026-11-18`), `today`, `tomorrow` and `now` work too.
+
 ✏️ = write tools, registered only when `ENABLE_WRITE_TOOLS=true` (the default).
 ✉️ = send tools, registered only when `ENABLE_SEND_TOOLS=true` (the default).
 With `ENABLE_SEND_TOOLS=false` the agent can prepare drafts but never send;
 you send them from Outlook.
+📅 = can notify other people (invitations, updates, responses, cancellations),
+which is treated exactly like sending mail: see the approval section. With
+`ENABLE_SEND_TOOLS=false` these tools still work on your own calendar, but
+refuse anything that would notify someone.
 
 **Writing.** Bodies take `format="text"` (as typed, line breaks kept),
 `"markdown"` (bold, lists, links, tables) or `"html"`. Recipients are email
@@ -109,6 +132,17 @@ Mail can't be recalled, so sending has three independent safeguards:
    any other domain. Drafts are still allowed; a refused reply or forward stays in
    Drafts.
 
+**Calendar actions that notify people count as sending** and go through the
+same safeguards: `create_event` with attendees (invitations),
+`update_event` on a meeting you organise (updates), `respond_to_event` with
+`send_response=True` (the default) and `cancel_event` on a meeting. With
+`SEND_CONFIRMATION=elicit` you approve each one in a prompt showing the
+subject, time, attendees and text. `SEND_ALLOWED_DOMAINS` applies to attendees,
+and to the organiser when your response carries a comment or a proposed time
+(a plain accept/decline to an external organiser is allowed). Appointments
+without attendees, and changes to your own reminder, "show as" or categories,
+never notify anyone. Add the 📅 tools to the client's ask list too.
+
 ## Requirements
 
 - **Server:** Linux with systemd 250 or newer and a TPM 2.0 chip (for example
@@ -116,10 +150,13 @@ Mail can't be recalled, so sending has three independent safeguards:
 - **Entra ID app registration** (App ID + tenant ID):
   - Delegated permissions with admin consent:
     - required: `openid`, `offline_access`, `User.Read`, `Mail.ReadWrite`, `Mail.Send`;
+    - for the calendar tools: `Calendars.ReadWrite` (your calendars, events,
+      invitations, and colleagues' free/busy for `find_free_time`);
     - recommended: `People.Read` and `User.ReadBasic.All` (`find_people` searches
       the directory and your frequent contacts; without them it only finds
-      addresses that appear in your own mail), `MailboxSettings.Read` (`whoami`
-      shows your time zone and whether auto-reply is on).
+      addresses that appear in your own mail), `MailboxSettings.Read` (your
+      Outlook time zone for calendar times unless `TIMEZONE` is set, and
+      `whoami` shows whether auto-reply is on).
 
     The server requests `https://graph.microsoft.com/.default`, so it gets
     exactly what has been consented; optional features degrade gracefully when a
@@ -292,6 +329,10 @@ Settings in `/etc/outlook-mcp/outlook-mcp.env` (see [`deploy/outlook-mcp.env.exa
 | `SEND_CONFIRMATION` | `client` | `elicit`: the server itself asks you to approve every send |
 | `SEND_ALLOWED_DOMAINS` | empty (any) | Comma-separated domains mail may be sent to |
 | `SIGNATURE_FILE` | none | Signature appended to outgoing mail (`.html`/`.htm` as HTML, else text) |
+| `ENABLE_CALENDAR_TOOLS` | `true` | `false` removes the calendar tools |
+| `TIMEZONE` | Outlook setting, else UTC | IANA time zone for calendar times, e.g. `Asia/Dubai` |
+| `WORKING_HOURS` | Outlook setting, else `08:00-17:00` | Hours `find_free_time` searches by default |
+| `WORKING_DAYS` | Outlook setting, else `mon-fri` | Days `find_free_time` searches, e.g. `sun-thu` |
 | `KEEPALIVE_HOURS` | `12` | Background token refresh interval; `0` disables it |
 | `MAX_BODY_CHARS` | `20000` | Default body cut-off in `get_message` (continue with `offset`) |
 | `MAX_ATTACHMENT_MB` | `25` | Largest attachment `get_attachment` downloads |
@@ -348,8 +389,14 @@ sudo systemctl restart outlook-mcp && sudo outlook-mcp-authorize
   few minutes behind new mail; `list_messages` reads the folder directly.
 - **Shared mailboxes** aren't supported; they would need `Mail.ReadWrite.Shared`
   and `Mail.Send.Shared`.
-- **Meeting invitations** show as messages marked `(eventMessageRequest)`;
-  accepting or declining them would need `Calendars.ReadWrite`.
+- **Meeting invitations** show in mail as messages marked
+  `(eventMessageRequest)`; answer them with `respond_to_event(message_id=…)`,
+  or find them all with `list_events(needs_response=True)`.
+- **Free/busy of other people** comes from Outlook's free/busy sharing: people
+  outside your organisation (and some resources) are usually not visible, and
+  `find_free_time` says so. Only your own working hours are used.
+- **Other people's calendars** and delegate access aren't supported; they would
+  need `Calendars.ReadWrite.Shared`.
 - If the service fails with a memory-protection error, comment out
   `MemoryDenyWriteExecute=yes` in the unit, then run `daemon-reload` and restart.
 
@@ -374,6 +421,7 @@ Offline tests (Graph and Entra ID are mocked by an in-memory mailbox, no tenant 
 
 ```bash
 python tests/test_mail.py -v                    # -v prints sample output
+python tests/test_calendar.py -v
 ```
 
 ## License

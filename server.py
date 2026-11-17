@@ -6,6 +6,10 @@ Write tools (ENABLE_WRITE_TOOLS=true): create_draft, create_reply_draft,
               create_forward_draft, update_draft, delete_draft, mark_read,
               flag_messages, set_categories, move_messages, create_folder.
 Send tools (ENABLE_SEND_TOOLS=true): send_draft, send_mail, reply, forward.
+Calendar (ENABLE_CALENDAR_TOOLS=true): list_calendars, list_events, get_event,
+              find_free_time; with write tools also create_event, update_event,
+              respond_to_event, cancel_event (anything that notifies other people
+              needs ENABLE_SEND_TOOLS and goes through the same send approval).
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
@@ -32,6 +36,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import compose
+import events as cal
 import formatting as fmt
 from auth import AuthError, TokenManager, check_client_id, check_tenant
 from compose import ComposeError
@@ -117,6 +122,16 @@ KEEPALIVE_HOURS = float(os.getenv("KEEPALIVE_HOURS", "12"))
 MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "20000"))
 MAX_ATTACHMENT_MB = float(os.getenv("MAX_ATTACHMENT_MB", "25"))
 SIGNATURE_HTML = _signature()
+ENABLE_CALENDAR = _flag("ENABLE_CALENDAR_TOOLS", "true")
+TIMEZONE = os.getenv("TIMEZONE", "").strip()      # IANA, e.g. Asia/Dubai; empty = mailbox setting
+if TIMEZONE and cal.zone(TIMEZONE) is None:
+    raise SystemExit(f"TIMEZONE {TIMEZONE!r} is not a known time zone (use an IANA name like Asia/Dubai)")
+try:
+    WORKING_DAYS = cal.parse_days(os.getenv("WORKING_DAYS", ""))   # empty = from Outlook
+    _wh = os.getenv("WORKING_HOURS", "").strip()                   # e.g. 08:00-17:00
+    WORKING_HOURS = tuple(cal.parse_hhmm(x) for x in _wh.split("-", 1)) if _wh else None
+except (ValueError, IndexError):
+    raise SystemExit("WORKING_DAYS must look like 'mon-fri' and WORKING_HOURS like '08:00-17:00'") from None
 
 vault = Vault(VAULT_PATH, VAULT_KEY, vault_context(TENANT, CLIENT_ID))
 tokens = TokenManager(vault, TENANT, CLIENT_ID, CLIENT_SECRET)
@@ -145,6 +160,15 @@ def _instructions() -> str:
                      "subject and full text and get their explicit approval.")
     else:
         parts.append("This server cannot send mail: save drafts and let the user send them from Outlook.")
+    if ENABLE_CALENDAR:
+        parts.append("Calendar: list_events for a time range (needs_response=True for unanswered "
+                     "invitations), get_event for details, find_free_time for open slots with or without "
+                     "attendees. Calendar times are in the user's time zone (see whoami), not UTC.")
+        if ENABLE_WRITE:
+            parts.append("create_event without attendees only touches the user's calendar. create_event with "
+                         "attendees, update_event on a meeting the user organises, respond_to_event (unless "
+                         "send_response=False) and cancel_event send mail to other people: get the user's "
+                         "explicit approval of the details first, as for sending mail.")
     return " ".join(parts)
 
 
@@ -234,7 +258,8 @@ async def _me() -> dict:
     addrs |= {p.split(":", 1)[1].lower() for p in me.get("proxyAddresses") or []
               if p.lower().startswith("smtp:")}
     _me_cache.clear()
-    _me_cache.update({"id": me.get("id"), "name": me.get("displayName"), "addresses": addrs})
+    _me_cache.update({"id": me.get("id"), "name": me.get("displayName"), "addresses": addrs,
+                      "mail": me.get("mail") or me.get("userPrincipalName")})
     return _me_cache
 
 
@@ -339,8 +364,11 @@ async def whoami_data() -> dict:
         "write_tools": ENABLE_WRITE, "send_tools": ENABLE_SEND,
         "send_confirmation": SEND_CONFIRMATION if ENABLE_SEND else None,
         "send_allowed_domains": ALLOWED_DOMAINS or None,
-        "signature": bool(SIGNATURE_HTML),
+        "signature": bool(SIGNATURE_HTML), "calendar": ENABLE_CALENDAR,
     }
+    if ENABLE_CALENDAR:
+        out["calendar"] = {"time_zone": (await _tz()).key,
+                           "time_zone_source": "TIMEZONE setting" if TIMEZONE else "mailbox settings"}
     return out
 
 
@@ -360,7 +388,11 @@ def whoami_text(d: dict) -> str:
     m = d.get("mailbox")
     if m:
         lines.append("Mailbox: " + " · ".join(f"{k.replace('_', ' ')} {v}" for k, v in m.items()))
-    modes = ["read"] + (["drafts/organise"] if s["write_tools"] else []) + (["send"] if s["send_tools"] else [])
+    c = d.get("calendar")
+    if c:
+        lines.append(f"Calendar: times shown in {c['time_zone']} (from {c['time_zone_source']})")
+    modes = (["read"] + (["drafts/organise"] if s["write_tools"] else []) + (["send"] if s["send_tools"] else [])
+             + (["calendar"] if s.get("calendar") else []))
     line = "Server: " + ", ".join(modes)
     if s["send_tools"]:
         line += f" · send confirmation: {s['send_confirmation']}"
@@ -983,24 +1015,19 @@ def _modern(ctx: Context) -> bool:
     return bool(check and check())
 
 
-async def _confirm_send(ctx: Context | None, m: dict, verb: str) -> None:
-    """Enforce SEND_ALLOWED_DOMAINS and, with SEND_CONFIRMATION=elicit, get the
-    human's approval. Raises Ask when the client must ask the user first."""
-    rcpt = (m.get("toRecipients") or []) + (m.get("ccRecipients") or []) + (m.get("bccRecipients") or [])
-    if not rcpt:
-        raise ToolError("The message has no recipients.")
-    compose.check_allowed(rcpt, ALLOWED_DOMAINS)
+async def _approve(ctx: Context | None, prompt: str, state: str, *, declined: str, no_ui: str,
+                   no_ctx: str) -> None:
+    """With SEND_CONFIRMATION=elicit, ask the human to approve `prompt`. `state`
+    identifies exactly what is being approved (id|fingerprint). Raises Ask when a
+    2026-07-28 client must show the prompt first; fails closed otherwise."""
     if SEND_CONFIRMATION != "elicit":
         return
-    kept = f"; the draft {m['id']} is kept" if m.get("isDraft") else ""
     if ctx is None:
-        raise ToolError("Send approval is required but there is no client session. Nothing was sent" + kept)
-    prompt = _prompt(m, verb)
+        raise ToolError(no_ctx)
     if _modern(ctx):
-        state = f"{m.get('id') or 'new'}|{_fingerprint(m)}"
         answer = (ctx.input_responses or {}).get("approve")
         if answer is None or ctx.request_state != state:
-            # First leg, or the message changed since the user was asked: ask (again).
+            # First leg, or the content changed since the user was asked: ask (again).
             raise Ask(InputRequiredResult(
                 input_requests={"approve": ElicitRequest(params=ElicitRequestFormParams(
                     message=prompt, requested_schema=APPROVE_SCHEMA))},
@@ -1011,14 +1038,29 @@ async def _confirm_send(ctx: Context | None, m: dict, verb: str) -> None:
         try:
             res = await ctx.elicit(prompt, ["send", "cancel"])
         except Exception as e:
-            log.warning("Send approval could not be shown: %s", e)
-            raise ToolError("This server requires the user to approve each send, and this client can't "
-                            "show the approval prompt. The message was NOT sent"
-                            + (f"; it is saved as draft {m['id']}" if m.get("isDraft") else "")
-                            + ". The user can send it from Outlook.") from None
+            log.warning("Approval prompt could not be shown: %s", e)
+            raise ToolError(no_ui) from None
         action, value = getattr(res, "action", None), getattr(res, "data", None)
     if action != "accept" or value != "send":
-        raise ToolError("The user did not approve sending. Nothing was sent" + kept + ".")
+        raise ToolError(declined)
+
+
+async def _confirm_send(ctx: Context | None, m: dict, verb: str) -> None:
+    """Enforce SEND_ALLOWED_DOMAINS and, with SEND_CONFIRMATION=elicit, get the
+    human's approval. Raises Ask when the client must ask the user first."""
+    rcpt = (m.get("toRecipients") or []) + (m.get("ccRecipients") or []) + (m.get("bccRecipients") or [])
+    if not rcpt:
+        raise ToolError("The message has no recipients.")
+    compose.check_allowed(rcpt, ALLOWED_DOMAINS)
+    kept = f"; the draft {m['id']} is kept" if m.get("isDraft") else ""
+    await _approve(
+        ctx, _prompt(m, verb), f"{m.get('id') or 'new'}|{_fingerprint(m)}",
+        declined="The user did not approve sending. Nothing was sent" + kept + ".",
+        no_ui="This server requires the user to approve each send, and this client can't show the "
+              "approval prompt. The message was NOT sent"
+              + (f"; it is saved as draft {m['id']}" if m.get("isDraft") else "")
+              + ". The user can send it from Outlook.",
+        no_ctx="Send approval is required but there is no client session. Nothing was sent" + kept)
 
 
 def _sent_line(m: dict, verb: str) -> str:
@@ -1289,6 +1331,616 @@ if ENABLE_WRITE:
 if ENABLE_SEND:
     for _fn in SEND_TOOLS:
         mcp.tool(annotations=SENDS, output_schema=None)(_fn)
+
+
+# ---------------------------------------------------------------- calendar
+_tz_cache: dict = {}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+async def _tz():
+    """The time zone calendar times are shown and entered in: TIMEZONE, else the
+    mailbox's setting (needs MailboxSettings.Read), else UTC."""
+    if TIMEZONE:
+        return cal.zone(TIMEZONE)
+    uid = tokens.user.get("id")
+    if _tz_cache.get("uid") != uid or not _tz_cache.get("tz"):
+        tz = None
+        try:
+            s = await graph.get("/me/mailboxSettings", {"$select": "timeZone"})
+            tz = cal.zone(s.get("timeZone"))
+        except GraphError:
+            pass
+        _tz_cache.update(uid=uid, tz=tz or cal.zone("UTC"))
+    return _tz_cache["tz"]
+
+
+def _when(value: str, label: str, tz, now: datetime) -> datetime:
+    try:
+        return cal.parse_local(value, tz, now)
+    except ValueError:
+        raise ToolError(f"{label} must be a date or date/time like 2026-11-18, 2026-11-18T09:30 (in "
+                        f"{tz.key}), 2026-11-18T05:30:00Z, 'today', 'tomorrow' or 'now'.") from None
+
+
+async def _calendars() -> list[dict]:
+    rows, _ = await graph.get_all("/me/calendars", {"$select": "id,name,isDefaultCalendar,canEdit,owner,color",
+                                                     "$top": "100"}, limit=200)
+    return rows
+
+
+async def _calendar_path(calendar: str) -> str:
+    """'' = the default calendar; otherwise a calendar name or id."""
+    calendar = (calendar or "").strip()
+    if not calendar:
+        return "/me/calendar"
+    rows = await _calendars()
+    for c in rows:
+        if c.get("id") == calendar or (c.get("name") or "").lower() == calendar.lower():
+            return f"/me/calendars/{_q(c['id'])}"
+    raise ToolError(f"No calendar named {calendar!r}. Calendars: "
+                    + ", ".join(c.get("name") or "?" for c in rows))
+
+
+def _event_id(value: str) -> str:
+    return _id(value, "event_id", "list_events")
+
+
+async def _get_event(event_id: str, full: bool = True) -> dict:
+    return await graph.get(f"/me/events/{_q(_event_id(event_id))}",
+                           {"$select": cal.EVENT_FULL_FIELDS if full else cal.EVENT_FIELDS}, text_body=full)
+
+
+async def list_calendars_data() -> list[dict]:
+    return [{k: v for k, v in {
+        "name": c.get("name"), "calendar_id": c.get("id"), "default": c.get("isDefaultCalendar") or None,
+        "can_edit": c.get("canEdit"), "owner": fmt.addr_text({"name": (c.get("owner") or {}).get("name"),
+                                                              "email": (c.get("owner") or {}).get("address")}),
+    }.items() if v is not None} for c in await _calendars()]
+
+
+def calendars_text(rows: list[dict]) -> str:
+    return "\n".join(f"{c['name']}" + (" (default)" if c.get("default") else "")
+                     + ("" if c.get("can_edit") else " · read-only") + f" · owner {c.get('owner')}"
+                     + f"\n{fmt._PAD}id {c['calendar_id']}" for c in rows) or "No calendars."
+
+
+async def list_events_data(start: str, end: str, days: int, calendar: str, query: str,
+                           needs_response: bool, limit: int) -> dict:
+    tz, now = await _tz(), _now()
+    s = _when(start, "start", tz, now) if start.strip() else cal.parse_local("today", tz, now)
+    e = _when(end, "end", tz, now) if end.strip() else s + timedelta(days=_clamp(days, 1, 92))
+    if cal.is_date(end) and end.strip():
+        e += timedelta(days=1)  # an end date includes that whole day
+    if e <= s:
+        raise ToolError("end must be after start.")
+    if e - s > timedelta(days=366):
+        raise ToolError("At most one year per call.")
+    limit = _clamp(limit, 1, 200)
+    q = (query or "").strip().lower()
+
+    def keep(ev: dict) -> bool:
+        d = cal.event(ev, tz)
+        if needs_response and not cal.needs_response(d):
+            return False
+        if q:
+            hay = json.dumps([ev.get("subject"), (ev.get("location") or {}).get("displayName"),
+                              ev.get("organizer"), ev.get("attendees")], ensure_ascii=False).lower()
+            return all(w in hay for w in q.split())
+        return True
+
+    rows, why = await graph.scan(
+        f"{await _calendar_path(calendar)}/calendarView",
+        {"startDateTime": fmt.iso_z(s), "endDateTime": fmt.iso_z(e), "$select": cal.EVENT_FIELDS,
+         "$orderby": "start/dateTime", "$top": "100"},
+        limit=limit, keep=keep, max_scan=2000)
+    return {"time_zone": tz.key, "start": s.isoformat(), "end": e.isoformat(),
+            "events": [cal.event(ev, tz) for ev in rows], "more": why in ("limit", "scan"),
+            "filter": " · ".join(x for x in (f"matching {query!r}" if q else "",
+                                             "needing your response" if needs_response else "") if x)}
+
+
+def events_text(d: dict) -> str:
+    s, e = datetime.fromisoformat(d["start"]), datetime.fromisoformat(d["end"])
+    last = e - timedelta(minutes=1)
+    span = (cal.day_label(s.date()) if s.date() == last.date()
+            else f"{cal.day_label(s.date())} to {cal.day_label(last.date())}")
+    n = len(d["events"])
+    head = (f"{n} event{'s' if n != 1 else ''}" + (f" {d['filter']}" if d.get("filter") else "")
+            + f", {span} (times {d['time_zone']})")
+    note = "more events match: narrow the range or raise limit" if d.get("more") else None
+    return fmt.with_header(head, cal.render_events(d["events"]) or "Nothing scheduled.", note)
+
+
+async def get_event_data(event_id: str, max_chars: int) -> dict:
+    tz = await _tz()
+    return {"time_zone": tz.key, **cal.event(await _get_event(event_id), tz,
+                                             body_chars=_clamp(max_chars, 200, 100000))}
+
+
+def event_text(d: dict) -> str:
+    return cal.render_event(d, d["time_zone"])
+
+
+async def find_free_time_data(start: str, end: str, duration_minutes: int, attendees,
+                              working_hours_only: bool, tentative_is_busy: bool, max_slots: int) -> dict:
+    tz, now = await _tz(), _now()
+    s = _when(start, "start", tz, now) if start.strip() else now.astimezone(tz)
+    e = _when(end, "end", tz, now) if end.strip() else s + timedelta(days=7)
+    if cal.is_date(end) and end.strip():
+        e += timedelta(days=1)
+    s = max(s, now.astimezone(tz))
+    if e <= s:
+        raise ToolError("The range is in the past or empty: end must be after start (and after now).")
+    if e - s > timedelta(days=42):
+        raise ToolError("Search at most 6 weeks at a time.")
+    minutes = _clamp(duration_minutes, 5, 1440)
+    others = compose.addresses(compose.parse_recipients(attendees, "attendees")) if attendees else []
+    me = (await _me()).get("mail")
+    people = [me] + [a for a in dict.fromkeys(others) if a.lower() not in (await _me())["addresses"]]
+    if len(people) > 20:
+        raise ToolError("At most 19 attendees per call.")
+    res = await graph.post("/me/calendar/getSchedule", {
+        "schedules": people, "availabilityViewInterval": 15,
+        "startTime": {"dateTime": s.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"},
+        "endTime": {"dateTime": e.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"},
+    })
+    busy_status = {"busy", "oof"} | ({"tentative"} if tentative_is_busy else set())
+    busy, unavailable, mine = [], [], None
+    for sched in res.get("value") or []:
+        who = sched.get("scheduleId") or "?"
+        if sched.get("error"):
+            unavailable.append({"email": who, "reason": (sched["error"].get("message") or "unknown")[:120]})
+            continue
+        if who.lower() == (me or "").lower():
+            mine = sched.get("workingHours")
+        for item in sched.get("scheduleItems") or []:
+            if item.get("status") in busy_status:
+                a, b = cal.from_graph(item.get("start"), tz), cal.from_graph(item.get("end"), tz)
+                if a and b:
+                    busy.append((a, b))
+    work = None
+    if working_hours_only:
+        wz = cal.zone(((mine or {}).get("timeZone") or {}).get("name")) or tz
+        days = WORKING_DAYS or [cal.DAYS.index(x) for x in (mine or {}).get("daysOfWeek") or []
+                                if x in cal.DAYS] or [0, 1, 2, 3, 4]
+        if WORKING_HOURS:
+            (h0, h1), wz = WORKING_HOURS, tz
+        elif mine and mine.get("startTime") and mine.get("endTime"):
+            h0, h1 = cal.parse_hhmm(mine["startTime"]), cal.parse_hhmm(mine["endTime"])
+        else:
+            h0, h1 = cal.parse_hhmm("08:00"), cal.parse_hhmm("17:00")
+        work = {"days": days, "start": h0, "end": h1, "tz": wz}
+    slots = cal.free_slots(s, e, busy, minutes, tz, work)
+    max_slots = _clamp(max_slots, 1, 100)
+    return {
+        "time_zone": tz.key, "minutes": minutes, "participants": people,
+        "working_hours": (f"{cal.days_text(work['days'])} {work['start']:%H:%M}–{work['end']:%H:%M}"
+                          + (f" {work['tz'].key}" if work["tz"].key != tz.key else "")) if work else None,
+        "slots": [{"start": a.isoformat(), "end": b.isoformat(), "minutes": int((b - a).total_seconds() // 60)}
+                  for a, b in slots[:max_slots]],
+        "more": len(slots) > max_slots, "unavailable": unavailable,
+    }
+
+
+# --- writing: anything that notifies other people counts as sending
+def _notify_allowed(what: str) -> None:
+    if not ENABLE_SEND:
+        raise ToolError(f"This server is configured not to send anything (ENABLE_SEND_TOOLS=false), so it "
+                        f"can't {what}.")
+
+
+def _event_prompt(head: str, ev: dict, tz) -> str:
+    d = cal.event(ev, tz, body_chars=1500)
+    lines = [head, f"Subject: {d['subject']}", f"When: {cal.when_text(d)} ({tz.key})"]
+    if ev.get("recurrence"):
+        lines.append(f"Repeats: {cal.recurrence_text(ev['recurrence'])}")
+    if d.get("location"):
+        lines.append(f"Where: {d['location']}")
+    if d.get("online_meeting"):
+        lines.append("Teams meeting: yes")
+    for kind in ("required", "optional"):
+        who = [fmt.addr_text(a) for a in d.get("attendees") or [] if a["type"] == kind]
+        if who:
+            lines.append(f"{kind.capitalize()}: " + "; ".join(who))
+    if d.get("body"):
+        lines += ["", d["body"]]
+    return "\n".join(lines)
+
+
+def _digest(*parts) -> str:
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:24]
+
+
+async def _approve_event(ctx, prompt: str, state: str, not_done: str) -> None:
+    await _approve(ctx, prompt, state,
+                   declined=f"The user did not approve. {not_done}",
+                   no_ui="This server requires the user to approve anything sent to other people, and this "
+                         f"client can't show the approval prompt. {not_done} The user can do it in Outlook.",
+                   no_ctx=f"Approval is required but there is no client session. {not_done}")
+
+
+def _attendees(required, optional) -> list[dict]:
+    out = []
+    for value, kind in ((required, "required"), (optional, "optional")):
+        if value:
+            for r in compose.parse_recipients(value, f"{kind} attendees"):
+                out.append({"emailAddress": r["emailAddress"], "type": kind})
+    return out
+
+
+def _recurrence(repeat: str, start: datetime, until: str, count: int, tz, now) -> dict | None:
+    repeat = (repeat or "").strip().lower()
+    if not repeat or repeat == "none":
+        return None
+    day = cal.DAYS[start.weekday()]
+    patterns = {
+        "daily": {"type": "daily", "interval": 1},
+        "weekdays": {"type": "weekly", "interval": 1, "daysOfWeek": cal.DAYS[:5], "firstDayOfWeek": "monday"},
+        "weekly": {"type": "weekly", "interval": 1, "daysOfWeek": [day]},
+        "biweekly": {"type": "weekly", "interval": 2, "daysOfWeek": [day]},
+        "monthly": {"type": "absoluteMonthly", "interval": 1, "dayOfMonth": start.day},
+    }
+    if repeat not in patterns:
+        raise ToolError("repeat must be one of: daily, weekdays, weekly, biweekly, monthly.")
+    rng: dict = {"startDate": start.date().isoformat(), "recurrenceTimeZone": cal.graph_tz_name(tz)}
+    if until.strip():
+        rng.update(type="endDate", endDate=_when(until, "repeat_until", tz, now).date().isoformat())
+    elif count:
+        rng.update(type="numbered", numberOfOccurrences=_clamp(count, 1, 999))
+    else:
+        rng["type"] = "noEnd"
+    return {"pattern": patterns[repeat], "range": rng}
+
+
+def _show_as(value: str) -> str:
+    if value not in cal.SHOW_AS:
+        raise ToolError("show_as must be one of: " + ", ".join(cal.SHOW_AS))
+    return value
+
+
+def _body(body: str, format: str) -> dict:
+    return {"contentType": "HTML", "content": compose.wrap_html(compose.build_body(body, format, None))}
+
+
+def _event_line(verb: str, ev: dict, tz, extra: str = "") -> str:
+    d = cal.event(ev, tz)
+    out = f"{verb} {d['subject']!r}, {cal.when_text(d)} ({tz.key})" + extra
+    if isinstance(d.get("online_meeting"), str):
+        out += f"\nTeams link: {d['online_meeting']}"
+    out += f"\nEvent id: {d['event_id']}"
+    if d.get("web_link"):
+        out += f"\nOpen in Outlook: {d['web_link']}"
+    return out
+
+
+async def create_event_data(ctx, subject, start, end, duration_minutes, all_day, attendees,
+                            optional_attendees, location, body, format, online_meeting, show_as,
+                            reminder_minutes, categories, sensitivity, calendar, repeat, repeat_until,
+                            repeat_count) -> str:
+    tz, now = await _tz(), _now()
+    s = _when(start, "start", tz, now)
+    if all_day:
+        s = datetime.combine(s.date(), datetime.min.time(), tz)
+        last = _when(end, "end", tz, now).date() if end.strip() else s.date()
+        e = datetime.combine(last + timedelta(days=1), datetime.min.time(), tz)  # end date is inclusive
+    else:
+        e = _when(end, "end", tz, now) if end.strip() else s + timedelta(minutes=_clamp(duration_minutes or 30,
+                                                                                      5, 1440 * 14))
+    if e <= s:
+        raise ToolError("end must be after start.")
+    if sensitivity not in ("normal", "private", "personal", "confidential"):
+        raise ToolError("sensitivity must be normal, private, personal or confidential.")
+    ev: dict = {
+        "subject": (subject or "").strip()[:255] or "(no subject)",
+        "start": cal.to_graph(s, tz), "end": cal.to_graph(e, tz), "isAllDay": bool(all_day),
+        "showAs": _show_as(show_as or ("free" if all_day else "busy")), "sensitivity": sensitivity,
+    }
+    if body.strip():
+        ev["body"] = _body(body, format)
+    if location.strip():
+        ev["location"] = {"displayName": location.strip()[:255]}
+    if online_meeting:
+        ev.update(isOnlineMeeting=True, onlineMeetingProvider="teamsForBusiness")
+    if reminder_minutes is not None:
+        ev.update(isReminderOn=reminder_minutes >= 0, reminderMinutesBeforeStart=max(reminder_minutes, 0))
+    if categories:
+        ev["categories"] = [c.strip() for c in (categories if isinstance(categories, list)
+                                                else categories.split(",")) if c.strip()]
+    rec = _recurrence(repeat, s, repeat_until, repeat_count, tz, now)
+    if rec:
+        ev["recurrence"] = rec
+    atts = _attendees(attendees, optional_attendees)
+    if atts:
+        _notify_allowed("send meeting invitations; create the event without attendees, and the user can "
+                        "invite people from Outlook")
+        compose.check_allowed(atts, ALLOWED_DOMAINS)
+        ev.update(attendees=atts, responseRequested=True, allowNewTimeProposals=True)
+        await _approve_event(ctx, _event_prompt("Send these meeting invitations as you?", ev, tz),
+                             f"new|{_digest(ev)}", "Nothing was created or sent.")
+    created = await graph.post(f"{await _calendar_path(calendar)}/events", ev)
+    extra = f" · invitations sent to {len(atts)} attendee{'s' if len(atts) != 1 else ''}" if atts else ""
+    return _event_line("Created", created, tz, extra)
+
+
+MEETING_FIELDS = ("subject", "start", "end", "location", "body", "attendees", "isOnlineMeeting",
+                  "onlineMeetingProvider")
+
+
+async def update_event_data(ctx, event_id, subject, start, end, location, body, format, add_attendees,
+                            add_optional_attendees, remove_attendees, online_meeting, show_as,
+                            reminder_minutes, categories) -> str:
+    tz, now = await _tz(), _now()
+    ev = await _get_event(event_id, full=False)
+    patch: dict = {}
+    if subject is not None:
+        patch["subject"] = subject.strip()[:255]
+    if start or end:
+        os_, oe = cal.from_graph(ev.get("start"), tz), cal.from_graph(ev.get("end"), tz)
+        if ev.get("isAllDay"):
+            ns = datetime.combine(_when(start, "start", tz, now).date(), datetime.min.time(), tz) if start \
+                else os_
+            ne = (datetime.combine(_when(end, "end", tz, now).date() + timedelta(days=1), datetime.min.time(),
+                                   tz) if end else ns + (oe - os_))
+        else:
+            ns = _when(start, "start", tz, now) if start else os_
+            ne = _when(end, "end", tz, now) if end else ns + (oe - os_)
+        if ne <= ns:
+            raise ToolError("end must be after start.")
+        patch.update(start=cal.to_graph(ns, tz), end=cal.to_graph(ne, tz))
+    if location is not None:
+        patch["location"] = {"displayName": location.strip()[:255]}
+    if body is not None:
+        patch["body"] = _body(body, format)
+    if online_meeting is not None:
+        patch["isOnlineMeeting"] = bool(online_meeting)
+        if online_meeting:
+            patch["onlineMeetingProvider"] = "teamsForBusiness"
+    current = ev.get("attendees") or []
+    added = _attendees(add_attendees, add_optional_attendees)
+    removed = set(compose.addresses(compose.parse_recipients(remove_attendees, "remove_attendees"))) \
+        if remove_attendees else set()
+    if added or removed:
+        have = {(a.get("emailAddress") or {}).get("address", "").lower() for a in current}
+        unknown = removed - have
+        if unknown:
+            raise ToolError("Not attendees of this event: " + ", ".join(sorted(unknown)))
+        kept = [a for a in current if (a.get("emailAddress") or {}).get("address", "").lower() not in removed]
+        patch["attendees"] = kept + [a for a in added
+                                     if a["emailAddress"]["address"].lower() not in have]
+    if show_as is not None:
+        patch["showAs"] = _show_as(show_as)
+    if reminder_minutes is not None:
+        patch.update(isReminderOn=reminder_minutes >= 0, reminderMinutesBeforeStart=max(reminder_minutes, 0))
+    if categories is not None:
+        patch["categories"] = [c.strip() for c in (categories if isinstance(categories, list)
+                                                   else categories.split(",")) if c.strip()]
+    if not patch:
+        raise ToolError("Nothing to change: give at least one field.")
+    meeting_change = any(k in patch for k in MEETING_FIELDS)
+    if meeting_change and not ev.get("isOrganizer"):
+        raise ToolError("You're an attendee of this meeting, not its organiser: only show_as, reminder_minutes "
+                        "and categories can be changed. To suggest another time, use respond_to_event with "
+                        "propose_start.")
+    attendees_after = patch.get("attendees", current)
+    notify = meeting_change and bool(attendees_after or current)
+    if notify:
+        _notify_allowed("send meeting updates to attendees")
+        compose.check_allowed(attendees_after, ALLOWED_DOMAINS)
+        preview = {**ev, **patch}
+        if "body" in patch:
+            preview["body"] = patch["body"]
+        changes = ", ".join(k for k in patch if k in MEETING_FIELDS and k != "onlineMeetingProvider")
+        await _approve_event(ctx, _event_prompt(f"Send this meeting update ({changes}) to the attendees as you?",
+                                                preview, tz),
+                             f"{ev['id']}|{_digest(patch)}", "The meeting was not changed.")
+    updated = await graph.patch(f"/me/events/{_q(ev['id'])}", patch)
+    n = len(attendees_after)
+    extra = f" · update sent to {n} attendee{'s' if n != 1 else ''}" if notify else ""
+    return _event_line("Updated", {**ev, **updated} if updated else {**ev, **patch}, tz, extra)
+
+
+RESPONSE_ACTIONS = {"accept": "accept", "tentative": "tentativelyAccept", "decline": "decline"}
+
+
+async def respond_to_event_data(ctx, event_id, message_id, response, comment, send_response,
+                                propose_start, propose_end) -> str:
+    tz, now = await _tz(), _now()
+    response = (response or "").strip().lower()
+    if response not in RESPONSE_ACTIONS:
+        raise ToolError("response must be accept, tentative or decline.")
+    if not event_id and message_id:
+        m = await graph.get(f"/me/messages/{_q(_id(message_id, 'message_id', 'list_messages'))}",
+                            {"$select": "id,subject", "$expand": "microsoft.graph.eventMessage/event($select=id)"})
+        event_id = (m.get("event") or {}).get("id")
+        if not event_id:
+            raise ToolError("That message isn't a meeting invitation (or the meeting no longer exists).")
+    if not event_id:
+        raise ToolError("Give event_id (from list_events) or the invitation's message_id.")
+    ev = await _get_event(event_id, full=False)
+    if ev.get("isOrganizer"):
+        raise ToolError("You organise this meeting, so there is nothing to answer. Use update_event or "
+                        "cancel_event.")
+    payload: dict = {"sendResponse": bool(send_response)}
+    if comment.strip():
+        payload["comment"] = comment.strip()
+    if propose_start:
+        if response == "accept":
+            raise ToolError("A new time can only be proposed with response 'tentative' or 'decline'.")
+        if not send_response:
+            raise ToolError("Proposing a new time needs send_response=True (the organiser must be told).")
+        os_, oe = cal.from_graph(ev.get("start"), tz), cal.from_graph(ev.get("end"), tz)
+        ps = _when(propose_start, "propose_start", tz, now)
+        pe = _when(propose_end, "propose_end", tz, now) if propose_end else ps + (oe - os_)
+        if pe <= ps:
+            raise ToolError("propose_end must be after propose_start.")
+        payload["proposedNewTime"] = {"start": cal.to_graph(ps, tz), "end": cal.to_graph(pe, tz)}
+    verb = {"accept": "Accept", "tentative": "Tentatively accept", "decline": "Decline"}[response]
+    if send_response:
+        _notify_allowed("send meeting responses; use send_response=False to record the answer only in the "
+                        "calendar")
+        if payload.get("comment") or payload.get("proposedNewTime"):
+            compose.check_allowed([ev.get("organizer") or {}], ALLOWED_DOMAINS)
+        org = fmt.addr_text(fmt.address(ev.get("organizer")))
+        head = f"{verb} this meeting and tell the organiser ({org}) as you?"
+        if payload.get("proposedNewTime"):
+            p = payload["proposedNewTime"]
+            head += (f"\nProposed new time: "
+                     f"{cal.when_text({'start': cal.from_graph(p['start'], tz).isoformat(), 'end': cal.from_graph(p['end'], tz).isoformat()})}")
+        if payload.get("comment"):
+            head += f"\nMessage: {payload['comment']}"
+        prompt = _event_prompt(head, {k: v for k, v in ev.items() if k != "body"}, tz)
+        await _approve_event(ctx, prompt, f"{ev['id']}|{_digest(response, payload)}",
+                             "The invitation was not answered.")
+    await graph.post(f"/me/events/{_q(ev['id'])}/{RESPONSE_ACTIONS[response]}", payload)
+    past = {"accept": "Accepted", "tentative": "Tentatively accepted", "decline": "Declined"}[response]
+    extra = (" · the organiser was notified" + (" with a proposed new time" if payload.get("proposedNewTime")
+                                                 else "")) if send_response else " · the organiser was not notified"
+    if response == "decline":
+        extra += " · removed from your calendar"
+    return _event_line(past, ev, tz, extra)
+
+
+async def cancel_event_data(ctx, event_id, comment) -> str:
+    tz = await _tz()
+    ev = await _get_event(event_id, full=False)
+    if not ev.get("isOrganizer"):
+        raise ToolError("You're an attendee of this meeting, not its organiser. To drop out, use "
+                        "respond_to_event with response='decline'.")
+    atts = ev.get("attendees") or []
+    if atts:
+        _notify_allowed("send meeting cancellations")
+        if comment.strip():
+            compose.check_allowed(atts, ALLOWED_DOMAINS)
+        head = f"Cancel this meeting and notify {len(atts)} attendee{'s' if len(atts) != 1 else ''} as you?"
+        if comment.strip():
+            head += f"\nMessage: {comment.strip()}"
+        await _approve_event(ctx, _event_prompt(head, ev, tz), f"{ev['id']}|{_digest('cancel', comment)}",
+                             "The meeting was not cancelled.")
+        await graph.post(f"/me/events/{_q(ev['id'])}/cancel", {"Comment": comment.strip()})
+        return _event_line("Cancelled", ev, tz, f" · cancellation sent to {len(atts)} attendee"
+                                                f"{'s' if len(atts) != 1 else ''}")
+    await graph.delete(f"/me/events/{_q(ev['id'])}")
+    return _event_line("Deleted", ev, tz, " · it was only in your calendar (no attendees)")
+
+
+# ---------------------------------------------------------------- calendar tools
+Attendees = Annotated[list[str] | str | None, Field(
+    description="Email addresses: a list, or one string separated by ';' or ','. Plain names are refused: "
+                "use find_people first.")]
+When = Annotated[str, Field(description="Date/time in the user's time zone (see whoami), e.g. "
+                                        "2026-11-18T09:30, or a date 2026-11-18, 'today', 'tomorrow', 'now'. "
+                                        "A Z or +hh:mm suffix is converted.")]
+
+
+async def list_calendars(output: str = "text") -> str:
+    """The user's calendars (name, id, owner). Most tools use the default
+    calendar unless you pass a calendar name."""
+    return await _run(list_calendars_data(), calendars_text, output)
+
+
+async def list_events(start: str = "", end: str = "", days: int = 7, calendar: str = "", query: str = "",
+                      needs_response: bool = False, limit: int = 50, output: str = "text") -> str:
+    """Events in a time range, oldest first, with recurring meetings expanded.
+    start defaults to today 00:00; end defaults to start + days (an end date
+    includes that whole day). query keeps events whose subject, location,
+    organiser or attendees contain all its words. needs_response=True keeps
+    invitations the user hasn't answered. Times are in the user's time zone."""
+    return await _run(list_events_data(start, end, days, calendar, query, needs_response, limit),
+                      events_text, output)
+
+
+async def get_event(event_id: str, max_chars: int = 8000, output: str = "text") -> str:
+    """One event in full: time, recurrence, location, Teams link, organiser,
+    each attendee's response, and the description."""
+    return await _run(get_event_data(event_id, max_chars), event_text, output)
+
+
+async def find_free_time(start: When = "", end: When = "", duration_minutes: int = 30,
+                         attendees: Attendees = None, working_hours_only: bool = True,
+                         tentative_is_busy: bool = True, max_slots: int = 20, output: str = "text") -> str:
+    """Free time for the user, and for attendees if given (their free/busy from
+    Outlook), at least duration_minutes long. Defaults: from now for 7 days,
+    within the user's Outlook working hours. Use it before proposing or creating
+    a meeting. People outside the organisation are usually not visible and are
+    reported as such."""
+    return await _run(find_free_time_data(start, end, duration_minutes, attendees, working_hours_only,
+                                          tentative_is_busy, max_slots), cal.render_slots, output)
+
+
+async def create_event(subject: str, start: When, ctx: Context, end: When = "", duration_minutes: int = 30,
+                       all_day: bool = False, attendees: Attendees = None, optional_attendees: Attendees = None,
+                       location: str = "", body: str = "", format: str = "text", online_meeting: bool = False,
+                       show_as: str = "", reminder_minutes: int | None = None,
+                       categories: list[str] | str | None = None, sensitivity: str = "normal",
+                       calendar: str = "", repeat: str = "", repeat_until: str = "",
+                       repeat_count: int = 0) -> str | InputRequiredResult:
+    """Create an appointment, or a meeting when attendees are given.
+    WITH ATTENDEES, INVITATIONS ARE SENT IMMEDIATELY: only after the user approved
+    the subject, time, attendees and text. Without attendees nothing is sent.
+    end, or duration_minutes (default 30). all_day: start/end are dates, end
+    inclusive. online_meeting=True adds a Teams link. show_as: busy (default),
+    free, tentative, oof, workingElsewhere. reminder_minutes: -1 = no reminder.
+    repeat: daily, weekdays, weekly, biweekly, monthly (with repeat_until date or
+    repeat_count)."""
+    return await _call_send(create_event_data(
+        ctx, subject, start, end, duration_minutes, all_day, attendees, optional_attendees, location, body,
+        format, online_meeting, show_as, reminder_minutes, categories, sensitivity, calendar, repeat,
+        repeat_until, repeat_count))
+
+
+async def update_event(event_id: str, ctx: Context, subject: str | None = None, start: When = "",
+                       end: When = "", location: str | None = None, body: str | None = None,
+                       format: str = "text", add_attendees: Attendees = None,
+                       add_optional_attendees: Attendees = None, remove_attendees: Attendees = None,
+                       online_meeting: bool | None = None, show_as: str | None = None,
+                       reminder_minutes: int | None = None,
+                       categories: list[str] | str | None = None) -> str | InputRequiredResult:
+    """Change an event. Only the fields given change; a new start without end
+    keeps the duration. If the user organises a meeting with attendees, changes
+    to time, place, text or attendees SEND AN UPDATE to everyone: only after the
+    user approved the change. As an attendee only show_as, reminder_minutes and
+    categories can be changed. Pass an occurrence's id for one occurrence, or the
+    series id for the whole series."""
+    return await _call_send(update_event_data(
+        ctx, event_id, subject, start, end, location, body, format, add_attendees, add_optional_attendees,
+        remove_attendees, online_meeting, show_as, reminder_minutes, categories))
+
+
+async def respond_to_event(response: str, ctx: Context, event_id: str = "", message_id: str = "",
+                           comment: str = "", send_response: bool = True, propose_start: When = "",
+                           propose_end: When = "") -> str | InputRequiredResult:
+    """Answer a meeting invitation: response 'accept', 'tentative' or 'decline'.
+    Give event_id (from list_events) or the invitation email's message_id. By
+    default the organiser is told (with the optional comment): only after the user
+    approved this answer. send_response=False records it silently. With
+    tentative/decline, propose_start (and propose_end) suggests another time.
+    Use the series id to answer every occurrence of a recurring meeting.
+    Declining removes the meeting from the calendar."""
+    return await _call_send(respond_to_event_data(ctx, event_id, message_id, response, comment,
+                                                  send_response, propose_start, propose_end))
+
+
+async def cancel_event(event_id: str, ctx: Context, comment: str = "") -> str | InputRequiredResult:
+    """Cancel a meeting the user organises (SENDS A CANCELLATION to all attendees,
+    with the optional comment: only after the user approved), or delete an
+    appointment that has no attendees. Pass the series id to cancel the whole
+    series. For meetings organised by someone else, decline with respond_to_event."""
+    return await _call_send(cancel_event_data(ctx, event_id, comment))
+
+
+CALENDAR_READ_TOOLS = (list_calendars, list_events, get_event, find_free_time)
+CALENDAR_WRITE_TOOLS = (create_event, update_event, respond_to_event, cancel_event)
+
+if ENABLE_CALENDAR:
+    for _fn in CALENDAR_READ_TOOLS:
+        mcp.tool(**READ)(_fn)
+    if ENABLE_WRITE:
+        for _fn in CALENDAR_WRITE_TOOLS:
+            mcp.tool(annotations=SENDS, output_schema=None)(_fn)
 
 
 # ---------------------------------------------------------------- http + auth

@@ -20,7 +20,7 @@ fi
 echo "==> Copying application to $APP"
 install -d -m 0755 "$APP" "$APP/app" "$APP/bin"
 install -m 0644 "$SRC"/server.py "$SRC"/auth.py "$SRC"/vault.py "$SRC"/graph_client.py \
-  "$SRC"/formatting.py "$SRC"/compose.py "$SRC"/extract.py "$SRC"/authorize.py \
+  "$SRC"/formatting.py "$SRC"/compose.py "$SRC"/extract.py "$SRC"/events.py "$SRC"/authorize.py \
   "$SRC"/requirements.txt "$APP/app/"
 install -m 0755 "$SRC"/deploy/authorize.sh "$SRC"/deploy/seal-credential.sh "$APP/bin/"
 ln -sf "$APP/bin/authorize.sh" /usr/local/sbin/outlook-mcp-authorize
